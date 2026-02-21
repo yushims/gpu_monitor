@@ -528,19 +528,35 @@ def scan_batch_resource_group(subscription_id, rg, rg_lower, ctx, team_jobs, clu
 def print_summary(team_jobs, cluster_jobs, ctx):
     logger.info(f"\nSummary of jobs submitted in the last {ctx.days_ago} days (since {ctx.cutoff}):")
     logger.info("--------")
-    for creater, status_count in team_jobs.items():
-        for status, counts in status_count.items():
+
+    def creator_total_jobs(creater):
+        status_count = team_jobs.get(creater, {})
+        return sum(status_count.get(status, {}).get("num_jobs", 0) for status in STATUS_LIST)
+
+    all_creaters = set(team_jobs.keys()) | set(ctx.user_alias_map.keys())
+    sorted_creaters = sorted(all_creaters, key=lambda creater: (-creator_total_jobs(creater), creater))
+
+    for creater in sorted_creaters:
+        status_count = team_jobs.get(creater, {})
+        if not status_count:
+            logger.debug(f"  {creater}: 0 jobs")
+            continue
+        for status in STATUS_LIST:
+            if status not in status_count:
+                continue
+            counts = status_count[status]
             logger.info(f"  {creater}: {counts['num_jobs']} {status} jobs with {counts['num_gpus']} GPUs" + \
                         (f" and {counts['unknown_gpus']} jobs with unknown number of GPUs" if counts['unknown_gpus'] > 0 else ""))
-    for team_member in ctx.user_alias_map.keys():
-        if team_member not in team_jobs:
-            logger.info(f"  {team_member}: 0 jobs")
+
     logger.info("--------")
     for cluster, status_count in cluster_jobs.items():
         logger.info(f"  Cluster: {cluster}")
         for user_type in [ctx.manager_fte_label, OTHER_USER_TYPE]:
             logger.info(f"    {user_type}:")
-            for status, counts in status_count.items():
+            for status in STATUS_LIST:
+                if status not in status_count:
+                    continue
+                counts = status_count[status]
                 if counts[user_type]['num_gpus'] > 0:
                     logger.info(f"      {counts[user_type]['num_jobs']} {status} jobs with {counts[user_type]['num_gpus']} GPUs")
                 if counts[user_type]['unknown_gpus'] > 0:
