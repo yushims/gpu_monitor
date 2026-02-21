@@ -536,6 +536,11 @@ def print_summary(team_jobs, cluster_jobs, ctx):
     all_creaters = set(team_jobs.keys()) | set(ctx.user_alias_map.keys())
     sorted_creaters = sorted(all_creaters, key=lambda creater: (-creator_total_jobs(creater), creater))
 
+    total_by_status = {
+        status: {"num_jobs": 0, "num_gpus": 0, "unknown_gpus": 0}
+        for status in STATUS_LIST
+    }
+
     for creater in sorted_creaters:
         status_count = team_jobs.get(creater, {})
         if not status_count:
@@ -545,6 +550,9 @@ def print_summary(team_jobs, cluster_jobs, ctx):
             if status not in status_count:
                 continue
             counts = status_count[status]
+            total_by_status[status]["num_jobs"] += counts["num_jobs"]
+            total_by_status[status]["num_gpus"] += counts["num_gpus"]
+            total_by_status[status]["unknown_gpus"] += counts["unknown_gpus"]
             logger.info(f"  {creater}: {counts['num_jobs']} {status} jobs with {counts['num_gpus']} GPUs" + \
                         (f" and {counts['unknown_gpus']} jobs with unknown number of GPUs" if counts['unknown_gpus'] > 0 else ""))
 
@@ -561,6 +569,13 @@ def print_summary(team_jobs, cluster_jobs, ctx):
                     logger.info(f"      {counts[user_type]['num_jobs']} {status} jobs with {counts[user_type]['num_gpus']} GPUs")
                 if counts[user_type]['unknown_gpus'] > 0:
                     logger.info(f"      {counts[user_type]['unknown_gpus']} {status} jobs with unknown number of GPUs")
+
+    logger.info("--------")
+    logger.info("  Total:")
+    for status in STATUS_LIST:
+        total = total_by_status[status]
+        logger.info(f"    {total['num_jobs']} {status} jobs with {total['num_gpus']} GPUs" + \
+                    (f" and {total['unknown_gpus']} jobs with unknown number of GPUs" if total['unknown_gpus'] > 0 else ""))
     logger.info("--------")
 
 
