@@ -12,10 +12,13 @@ from azure.mgmt.batch import BatchManagementClient
 from azure.batch import BatchServiceClient
 import requests
 from azure.ai.ml import MLClient
+from azure.ai.ml.entities import PipelineJob
 from datetime import datetime, timedelta, timezone
 import logging
 from gpu_helpers import (
-    resolve_ml_job_resources_compute,
+    VC_GPU_MAP,
+    resolve_ml_job_instance_count,
+    resolve_ml_job_gpus_per_instance,
     calc_max_workers,
     ensure_team_status_bucket,
     ensure_cluster_status_bucket,
@@ -89,22 +92,6 @@ RG_TYPE_MAP = {
     "batch_nd40rs_v2": "batch",
 }
 
-VC_GPU_MAP = {
-    "ast-sing-prod01-eus": 4,  # A100
-    "aisupercomputer": 4,  # A100
-    "ast-sing-prod02-eus": 1,  # A100
-    "spch-sing-am-e2e-eu": 8,  # V100
-    "spch-sing-am-e2e-sc": 8,  # V100
-    "spch-sing-prod-eu": 8,  # V100
-    "spch-sing-prod-sc": 8,  # V100
-    "spch-sing-prod-wu2": 8,  # V100
-    "spch-train-h200-safn": 8,  # H200
-    "batchv100x8x32g": 8,  # Batch V100
-    "v100_mark3": 8,  # Batch V100
-    "v100_mark2": 8,  # Batch V100
-    "nd40rs_v2": 8,  # Batch V100
-}
-
 OTHER_USER_TYPE = "Others"
 
 STATUS_LIST = [
@@ -122,7 +109,7 @@ ML_STATUS_MAP = {
     # 'Finalizing': 'Running',
     # 'NotResponding': 'Running',
     'Queued': 'Queued',
-    # 'NotStarted': 'Queued',
+    'NotStarted': 'Queued',
     # 'CancelRequested': 'Queued',
     # 'Completed': 'Completed',
     # 'Failed': 'Completed',
@@ -250,6 +237,7 @@ def get_batch_pool_info(batch_client, pool_id):
         'vm_size': pool.vm_size
     }
 
+
 # get jobs in a workspace
 def get_jobs(subscription_id, resource_group, workspace_name, cutoff, days=0):
     ml_client = MLClient(
@@ -265,27 +253,25 @@ def get_jobs(subscription_id, resource_group, workspace_name, cutoff, days=0):
         if days > 0 and job.creation_context.created_at < cutoff:  # older than cutoff
             break
 
-        job_type = str(getattr(job, "job_type", "")).lower()
-        should_query_child_jobs = job_type in {"pipeline", "sweep"}
-
-        has_child_jobs = False
-        if should_query_child_jobs:
-            child_jobs = ml_client.jobs.list(parent_job_name=job.name)
-            for child in child_jobs:
-                has_child_jobs = True
-                # Map job status to our standard statuses
-                mapped_status = ML_STATUS_MAP.get(child.status, child.status)
-                if mapped_status in STATUS_LIST:
-                    child.creation_context.created_by = child.creation_context.created_by.user_name
-                    if not hasattr(child, "resources") or not child.resources:
-                        parent_resources, _ = resolve_ml_job_resources_compute(job)
-                        setattr(child, "resources", parent_resources)
-                    if not hasattr(child, "compute") or not child.compute:
-                        _, parent_compute = resolve_ml_job_resources_compute(job)
-                        setattr(child, "compute", parent_compute)
-                    yield child
-
-        if not has_child_jobs:
+        if isinstance(job, PipelineJob):
+            if not job.jobs:
+                childs = ml_client.jobs.list(parent_job_name=job.name)
+                for child in childs:
+                    mapped_status = ML_STATUS_MAP.get(child.status, child.status)
+                    if mapped_status in STATUS_LIST:
+                        child._creation_context = job.creation_context
+                        yield child
+            else:
+                status_map = {run.display_name: run.status for run in ml_client.jobs.list(parent_job_name=job.name)}
+                for node_name, child_node in job.jobs.items():
+                    status = status_map.get(node_name, "NotStarted")
+                    mapped_status = ML_STATUS_MAP.get(status, status)
+                    if mapped_status in STATUS_LIST:
+                        child_node.display_name = node_name
+                        child_node._creation_context = job.creation_context
+                        child_node._status = status
+                        yield child_node
+        else:
             # Map job status to our standard statuses
             mapped_status = ML_STATUS_MAP.get(job.status, job.status)
             if mapped_status in STATUS_LIST:
@@ -354,15 +340,6 @@ def get_batch_job_creater(batch_client, job, tasks, user_alias_map):
             if alias.lower() == task.user_identity.user_name:
                 return creater
             
-            # only works for running tasks
-            # try:
-            #     files = list(batch_client.file.list_from_task(job.id, task.id))
-            #     for file in files:
-            #         if file.name.lower() == alias.lower():
-            #             return creater
-            # except Exception as e:
-            #     continue
-
     for task in tasks:
         # only works for running tasks
         try:
@@ -378,27 +355,18 @@ def get_batch_job_creater(batch_client, job, tasks, user_alias_map):
             
 # process ML jobs
 def add_ml_job_info(rg, job, creater, team_jobs, cluster_jobs, ctx):
-    # get number of instances
-    resources, compute = resolve_ml_job_resources_compute(job)
-    if resources is None:  # not a model training job
-        logger.info(f"      !!!Cannot get resources for job {job.display_name} from {creater}")
-        total_gpus = -1
-    else:
-        instance_count = getattr(resources, "instance_count", None)
-        if not instance_count:
-            logger.info(f"      !!!Cannot get instance count for job {job.display_name} from {creater}")
-            total_gpus = -1
-        elif compute is None:  # not a model training job
-            logger.info(f"      !!!Cannot get compute for job {job.display_name} from {creater}")
-            total_gpus = -1
-        else:
-            # number of GPUs per instance
-            vc = compute.split("/")[-1]
-            if vc not in VC_GPU_MAP:
-                logger.info(f"      !!!Unknown VC: {vc}, assuming 8 GPUs")
-                VC_GPU_MAP[vc] = 8
+    total_gpus = -1
 
-            total_gpus = VC_GPU_MAP[vc] * instance_count
+    gpus_per_instance = resolve_ml_job_gpus_per_instance(job)
+    if gpus_per_instance is None:
+        logger.info(f"      !!!Cannot resolve gpus per instance for job {job.display_name} from {job.creation_context.created_by}")
+    else:
+        instance_count = resolve_ml_job_instance_count(job)
+        if instance_count is None:
+            logger.info(f"      !!!Cannot resolve instance count for job {job.display_name} from {job.creation_context.created_by}")
+        else:
+            total_gpus = gpus_per_instance * instance_count
+
     logger.info(f"      ML Job of {creater}: {job.creation_context.created_by} | {job.display_name} | {job.creation_context.created_at} | {job.status} | {total_gpus} GPUs")
 
     team_bucket = ensure_team_status_bucket(team_jobs, creater, job.status)
@@ -457,6 +425,16 @@ def scan_batch_account_jobs(subscription_id, rg, rg_lower, account, ctx):
 
     job_entries = []
     max_workers = calc_max_workers(len(jobs), cap=ctx.max_batch_workers)
+    if max_workers <= 1:
+        for job in jobs:
+            try:
+                tasks = list(batch_client.task.list(job.id))
+                if creater := get_batch_job_creater(batch_client, job, tasks, ctx.user_alias_map):
+                    job_entries.append((rg_lower, job, tasks, creater))
+            except Exception as exc:
+                logger.info(f"      !!!Failed to process batch job {job.id}: {exc}")
+        return account, pool_infos, job_entries
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_job = {
             executor.submit(lambda j: list(batch_client.task.list(j.id)), job): job
@@ -484,6 +462,18 @@ def scan_ml_resource_group(subscription_id, rg, rg_lower, ctx, team_jobs, cluste
         return
 
     max_workers = calc_max_workers(len(workspaces), cap=ctx.max_ml_workers)
+    if max_workers <= 1:
+        for ws in workspaces:
+            logger.debug(f"    ML Workspace queued: {ws}")
+            try:
+                ws, job_entries, elapsed_sec = scan_workspace_jobs(subscription_id, rg, rg_lower, ws, ctx)
+                logger.info(f"    ML Workspace done: {ws} ({elapsed_sec:.1f}s)")
+                for rg_name, job, creater in job_entries:
+                    add_ml_job_info(rg_name, job, creater, team_jobs, cluster_jobs, ctx)
+            except Exception as exc:
+                logger.info(f"    !!!Failed to scan workspace {ws}: {exc}")
+        return
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_ws = {}
         for ws in workspaces:
@@ -508,6 +498,19 @@ def scan_batch_resource_group(subscription_id, rg, rg_lower, ctx, team_jobs, clu
         return
 
     max_workers = calc_max_workers(len(batch_accounts), cap=ctx.max_batch_workers)
+    if max_workers <= 1:
+        for account in batch_accounts:
+            try:
+                account, pool_infos, job_entries = scan_batch_account_jobs(subscription_id, rg, rg_lower, account, ctx)
+                logger.info(f"    Batch Account: {account}")
+                for pool_id, pool_info in pool_infos.items():
+                    logger.debug(f"      Pool {pool_id}: {pool_info['current_dedicated_nodes']} nodes ({pool_info['vm_size']})")
+                for rg_name, job, tasks, creater in job_entries:
+                    add_batch_job_info(rg_name, job, tasks, creater, team_jobs, cluster_jobs, ctx)
+            except Exception as exc:
+                logger.info(f"    !!!Failed to scan batch account: {exc}")
+        return
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(scan_batch_account_jobs, subscription_id, rg, rg_lower, account, ctx)
@@ -549,12 +552,12 @@ def print_summary(team_jobs, cluster_jobs, ctx):
         for status in STATUS_LIST:
             if status not in status_count:
                 continue
-            counts = status_count[status]
-            total_by_status[status]["num_jobs"] += counts["num_jobs"]
-            total_by_status[status]["num_gpus"] += counts["num_gpus"]
-            total_by_status[status]["unknown_gpus"] += counts["unknown_gpus"]
-            logger.info(f"  {creater}: {counts['num_jobs']} {status} jobs with {counts['num_gpus']} GPUs" + \
-                        (f" and {counts['unknown_gpus']} jobs with unknown number of GPUs" if counts['unknown_gpus'] > 0 else ""))
+            counts = status_count.get(status, {})
+            total_by_status[status]["num_jobs"] += counts.get("num_jobs", 0)
+            total_by_status[status]["num_gpus"] += counts.get("num_gpus", 0)
+            total_by_status[status]["unknown_gpus"] += counts.get("unknown_gpus", 0)
+            logger.info(f"  {creater}: {counts.get('num_jobs', 0)} {status} jobs with {counts.get('num_gpus', 0)} GPUs" + \
+                        (f" and {counts.get('unknown_gpus', 0)} jobs with unknown number of GPUs" if counts.get('unknown_gpus', 0) > 0 else ""))
 
     logger.info("--------")
     for cluster, status_count in cluster_jobs.items():
@@ -626,7 +629,7 @@ def main(
             logger.info(f"  Resource Group: {rg}")
             
             # Handle different resource types
-            rg_type = rg_type_lower_map[rg_lower]
+            rg_type = rg_type_lower_map.get(rg_lower, "ml")
             
             if rg_type == "ml":
                 scan_ml_resource_group(subscription_id, rg, rg_lower, ctx, team_jobs, cluster_jobs)
