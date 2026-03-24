@@ -4,6 +4,7 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from queue import Queue
 import time
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.resource import ResourceManagementClient
@@ -71,6 +72,7 @@ class RunContext:
 subscriptions = {
     "48b6cd5e-3ffe-4c2e-9e99-5760a42cd093": "AI Platform GPU 21 - Cognitive Services",
     "f0d830dc-9b44-446e-86dd-722e7de7c533": "AI Platform GPUs - Speech Quality Training",
+    "06c76609-9f7e-4814-bf7c-0c5916b9ad75": "AI Platform GPUs - AI Services Modern Training",
 }
 
 RG_CLUSTER_MAP = {
@@ -78,8 +80,9 @@ RG_CLUSTER_MAP = {
     "speech-sing": "V100",
     "ast-singularity-01": "A100",
     "ast-singularity-02": "A100",
-    "speech-training-h200": "H200",
     "batch_nd40rs_v2": "V100 Batch",
+    "speech-training-h200": "H200",
+    "aiservices-training-c01": "H100",
 }
 
 # Map resource groups to their type (ML or Batch)
@@ -88,8 +91,9 @@ RG_TYPE_MAP = {
     "speech-sing": "ml",
     "ast-singularity-01": "ml",
     "ast-singularity-02": "ml",
-    "speech-training-h200": "ml",
     "batch_nd40rs_v2": "batch",
+    "speech-training-h200": "ml",
+    "aiservices-training-c01": "ml",
 }
 
 OTHER_USER_TYPE = "Others"
@@ -401,15 +405,23 @@ def add_batch_job_info(rg, job, tasks, creater, team_jobs, cluster_jobs, ctx):
 
 
 def scan_workspace_jobs(subscription_id, rg, rg_lower, ws, ctx):
-    started_at = time.perf_counter()
-    job_entries = []
     logger.debug(f"    ML Workspace scanning: {ws}")
     for job in get_jobs(subscription_id, rg, ws, cutoff=ctx.cutoff, days=ctx.days_ago):
         if creater := get_job_creater(job, ctx.user_alias_map):
-            job_entries.append((rg_lower, job, creater))
             logger.debug(f"      ML Job found [{ws}] {job.status} | {creater} | {job.display_name}")
-    elapsed_sec = time.perf_counter() - started_at
-    return ws, job_entries, elapsed_sec
+            yield rg_lower, job, creater
+
+
+def scan_workspace_jobs_to_queue(subscription_id, rg, rg_lower, ws, ctx, result_queue):
+    started_at = time.perf_counter()
+    try:
+        for rg_name, job, creater in scan_workspace_jobs(subscription_id, rg, rg_lower, ws, ctx):
+            result_queue.put(("job", ws, rg_name, job, creater))
+        elapsed_sec = time.perf_counter() - started_at
+        result_queue.put(("done", ws, elapsed_sec, None))
+    except Exception as exc:
+        elapsed_sec = time.perf_counter() - started_at
+        result_queue.put(("done", ws, elapsed_sec, exc))
 
 
 def scan_batch_account_jobs(subscription_id, rg, rg_lower, account, ctx):
@@ -422,18 +434,18 @@ def scan_batch_account_jobs(subscription_id, rg, rg_lower, account, ctx):
             pool_infos[pool_id] = get_batch_pool_info(batch_client, pool_id)
         except Exception as exc:
             logger.info(f"    !!!Failed to get pool info for {pool_id}: {exc}")
+    yield "pool_infos", account, pool_infos
 
-    job_entries = []
     max_workers = calc_max_workers(len(jobs), cap=ctx.max_batch_workers)
     if max_workers <= 1:
         for job in jobs:
             try:
                 tasks = list(batch_client.task.list(job.id))
                 if creater := get_batch_job_creater(batch_client, job, tasks, ctx.user_alias_map):
-                    job_entries.append((rg_lower, job, tasks, creater))
+                    yield "job", rg_lower, job, tasks, creater
             except Exception as exc:
                 logger.info(f"      !!!Failed to process batch job {job.id}: {exc}")
-        return account, pool_infos, job_entries
+        return
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_job = {
@@ -445,11 +457,20 @@ def scan_batch_account_jobs(subscription_id, rg, rg_lower, account, ctx):
             try:
                 tasks = future.result()
                 if creater := get_batch_job_creater(batch_client, job, tasks, ctx.user_alias_map):
-                    job_entries.append((rg_lower, job, tasks, creater))
+                    yield "job", rg_lower, job, tasks, creater
             except Exception as exc:
                 logger.info(f"      !!!Failed to process batch job {job.id}: {exc}")
 
-    return account, pool_infos, job_entries
+def scan_batch_account_jobs_to_queue(subscription_id, rg, rg_lower, account, ctx, result_queue):
+    started_at = time.perf_counter()
+    try:
+        for event in scan_batch_account_jobs(subscription_id, rg, rg_lower, account, ctx):
+            result_queue.put(("event", account, event))
+        elapsed_sec = time.perf_counter() - started_at
+        result_queue.put(("done", account, elapsed_sec, None))
+    except Exception as exc:
+        elapsed_sec = time.perf_counter() - started_at
+        result_queue.put(("done", account, elapsed_sec, exc))
 
 
 # -----------------------------
@@ -465,31 +486,38 @@ def scan_ml_resource_group(subscription_id, rg, rg_lower, ctx, team_jobs, cluste
     if max_workers <= 1:
         for ws in workspaces:
             logger.debug(f"    ML Workspace queued: {ws}")
+            started_at = time.perf_counter()
             try:
-                ws, job_entries, elapsed_sec = scan_workspace_jobs(subscription_id, rg, rg_lower, ws, ctx)
-                logger.info(f"    ML Workspace done: {ws} ({elapsed_sec:.1f}s)")
-                for rg_name, job, creater in job_entries:
+                for rg_name, job, creater in scan_workspace_jobs(subscription_id, rg, rg_lower, ws, ctx):
                     add_ml_job_info(rg_name, job, creater, team_jobs, cluster_jobs, ctx)
+                elapsed_sec = time.perf_counter() - started_at
+                logger.info(f"    ML Workspace done: {ws} ({elapsed_sec:.1f}s)")
             except Exception as exc:
                 logger.info(f"    !!!Failed to scan workspace {ws}: {exc}")
         return
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_ws = {}
+        result_queue = Queue()
         for ws in workspaces:
             logger.debug(f"    ML Workspace queued: {ws}")
-            future = executor.submit(scan_workspace_jobs, subscription_id, rg, rg_lower, ws, ctx)
-            future_to_ws[future] = ws
+            executor.submit(scan_workspace_jobs_to_queue, subscription_id, rg, rg_lower, ws, ctx, result_queue)
 
-        for future in as_completed(future_to_ws):
-            ws = future_to_ws[future]
-            try:
-                ws, job_entries, elapsed_sec = future.result()
-                logger.info(f"    ML Workspace done: {ws} ({elapsed_sec:.1f}s)")
-                for rg_name, job, creater in job_entries:
-                    add_ml_job_info(rg_name, job, creater, team_jobs, cluster_jobs, ctx)
-            except Exception as exc:
+        completed_workspaces = 0
+        total_workspaces = len(workspaces)
+        while completed_workspaces < total_workspaces:
+            event = result_queue.get()
+            event_type = event[0]
+            if event_type == "job":
+                _, _, rg_name, job, creater = event
+                add_ml_job_info(rg_name, job, creater, team_jobs, cluster_jobs, ctx)
+                continue
+
+            _, ws, elapsed_sec, exc = event
+            completed_workspaces += 1
+            if exc:
                 logger.info(f"    !!!Failed to scan workspace {ws}: {exc}")
+            else:
+                logger.info(f"    ML Workspace done: {ws} ({elapsed_sec:.1f}s)")
 
 
 def scan_batch_resource_group(subscription_id, rg, rg_lower, ctx, team_jobs, cluster_jobs):
@@ -500,32 +528,55 @@ def scan_batch_resource_group(subscription_id, rg, rg_lower, ctx, team_jobs, clu
     max_workers = calc_max_workers(len(batch_accounts), cap=ctx.max_batch_workers)
     if max_workers <= 1:
         for account in batch_accounts:
+            started_at = time.perf_counter()
             try:
-                account, pool_infos, job_entries = scan_batch_account_jobs(subscription_id, rg, rg_lower, account, ctx)
-                logger.info(f"    Batch Account: {account}")
-                for pool_id, pool_info in pool_infos.items():
-                    logger.debug(f"      Pool {pool_id}: {pool_info['current_dedicated_nodes']} nodes ({pool_info['vm_size']})")
-                for rg_name, job, tasks, creater in job_entries:
+                for event in scan_batch_account_jobs(subscription_id, rg, rg_lower, account, ctx):
+                    event_type = event[0]
+                    if event_type == "pool_infos":
+                        _, account_name, pool_infos = event
+                        logger.info(f"    Batch Account: {account_name}")
+                        for pool_id, pool_info in pool_infos.items():
+                            logger.debug(f"      Pool {pool_id}: {pool_info['current_dedicated_nodes']} nodes ({pool_info['vm_size']})")
+                        continue
+
+                    _, rg_name, job, tasks, creater = event
                     add_batch_job_info(rg_name, job, tasks, creater, team_jobs, cluster_jobs, ctx)
+                elapsed_sec = time.perf_counter() - started_at
+                logger.info(f"    Batch Account done: {account} ({elapsed_sec:.1f}s)")
             except Exception as exc:
                 logger.info(f"    !!!Failed to scan batch account: {exc}")
         return
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(scan_batch_account_jobs, subscription_id, rg, rg_lower, account, ctx)
-            for account in batch_accounts
-        ]
-        for future in as_completed(futures):
-            try:
-                account, pool_infos, job_entries = future.result()
-                logger.info(f"    Batch Account: {account}")
-                for pool_id, pool_info in pool_infos.items():
-                    logger.debug(f"      Pool {pool_id}: {pool_info['current_dedicated_nodes']} nodes ({pool_info['vm_size']})")
-                for rg_name, job, tasks, creater in job_entries:
-                    add_batch_job_info(rg_name, job, tasks, creater, team_jobs, cluster_jobs, ctx)
-            except Exception as exc:
-                logger.info(f"    !!!Failed to scan batch account: {exc}")
+        result_queue = Queue()
+        for account in batch_accounts:
+            executor.submit(scan_batch_account_jobs_to_queue, subscription_id, rg, rg_lower, account, ctx, result_queue)
+
+        completed_accounts = 0
+        total_accounts = len(batch_accounts)
+        while completed_accounts < total_accounts:
+            event = result_queue.get()
+            event_kind = event[0]
+            if event_kind == "event":
+                _, _, batch_event = event
+                batch_event_type = batch_event[0]
+                if batch_event_type == "pool_infos":
+                    _, account_name, pool_infos = batch_event
+                    logger.info(f"    Batch Account: {account_name}")
+                    for pool_id, pool_info in pool_infos.items():
+                        logger.debug(f"      Pool {pool_id}: {pool_info['current_dedicated_nodes']} nodes ({pool_info['vm_size']})")
+                    continue
+
+                _, rg_name, job, tasks, creater = batch_event
+                add_batch_job_info(rg_name, job, tasks, creater, team_jobs, cluster_jobs, ctx)
+                continue
+
+            _, account, elapsed_sec, exc = event
+            completed_accounts += 1
+            if exc:
+                logger.info(f"    !!!Failed to scan batch account {account}: {exc}")
+            else:
+                logger.info(f"    Batch Account done: {account} ({elapsed_sec:.1f}s)")
 
 
 def print_summary(team_jobs, cluster_jobs, ctx):

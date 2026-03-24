@@ -158,6 +158,13 @@ vc_to_sub_rg_ws_dict = {
         "speech-training-prod-ws01",
         "speech-training-uai-safn",
     ),
+    # AI service cluster
+    "aiservices-vc01-eu2": (
+        "06c76609-9f7e-4814-bf7c-0c5916b9ad75",
+        "aiservices-training-c01",
+        "aiservices-prod-ws01-eus2",
+        "aiservices-training-c01-uai-eus2",
+    ),
 }
 
 FIPS_VCS = {"ast-sing-prod01-eus", "spch-tts-wu3"}
@@ -349,7 +356,7 @@ def get_vc_sub_rg_workspace_dict():
 
 
 def get_sku_detail_by_instance_type(instance_type):
-    """Get SKU details by Instance type (Series). This is only for sigularity"""
+    """Get SKU details by Instance type (Series). This is only for singularity"""
 
     sku_detail_dict = {
         # (GPU, Memory, GPU/Node, IB)
@@ -363,6 +370,7 @@ def get_sku_detail_by_instance_type(instance_type):
         "MI100": ("MI100", 32, 8, True),
         "ND96amsr_A100_v4": ("A100", 80, 8, True),
         "NDH200v5": ("H200", 141, 8, True),
+        "NDH100v5": ("H100", 80, 8, True),
     }
 
     if instance_type in sku_detail_dict:
@@ -439,6 +447,13 @@ def get_instance_type_by_sku(sku, gpu_count, is_ib):
             "ND96r_H200_v5-n1": ("H200", 141, 8, True),
             "ND96_H200_v5": ("H200", 141, 8, False),
             "ND96_H200_v5-n1": ("H200", 141, 8, False),
+        },
+        "NDH100v5": {
+            "ND12_H100_v5": ("H100", 80, 1, False),
+            "ND24_H100_v5": ("H100", 80, 2, False),
+            "ND48_H100_v5": ("H100", 80, 4, False),
+            "ND96_H100_v5": ("H100", 80, 8, False),
+            "ND96r_H100_v5": ("H100", 80, 8, True),
         },
     }
 

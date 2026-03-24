@@ -2,6 +2,8 @@ import ast
 import inspect
 import textwrap
 
+# download the latest skumanager.py from 
+# https://dev.azure.com/speedme/Speech/_git/Cascades?path=/aml_utils/skumanager.py&version=GBmain
 from skumanager import get_instance_type_by_sku
 
 
